@@ -1,18 +1,17 @@
 -- VocabDeck Extractor plugin entry point.
 --
--- This is the first "Extractor" built against AnnotationSync's proposed
--- Extractor interface (see AnnotationSync.koplugin#93). It reads VocabDeck's
--- own SQLite databases directly -- it does not require VocabDeck's plugin
--- code to be loaded or even installed as a *running* plugin, only that its
--- data files exist on disk, since extraction only ever reads files VocabDeck
--- itself already writes.
+-- This is the first "Extractor" built against AnnotationSync's Extractor
+-- interface (see AnnotationSync.koplugin#93 and its
+-- docs/writing-an-extractor.md). It reads VocabDeck's own SQLite databases
+-- directly -- it does not require VocabDeck's plugin code to be loaded or
+-- even installed as a *running* plugin, only that its data files exist on
+-- disk, since extraction only ever reads files VocabDeck itself already
+-- writes.
 --
--- Status: the read/diff/snapshot half (this plugin's actual job) is real and
--- testable today. The push-to-AnnotationSync half is a stub -- as of this
--- writing, AnnotationSync.koplugin has no pushExtractorData implementation
--- to call, no broadcast event to listen for, and no writeback_fn contract
--- defined yet. See onPushToAnnotationSync() below for exactly what's
--- deferred and why.
+-- Status: extraction, the sync-event hook, and the real pushExtractorData
+-- call are all live. writeback_fn (turning merged records back into
+-- VocabDeck rows -- the only way a card created on another device shows up
+-- here) is still a stub -- see stubWriteback() below.
 local _ = require("gettext")
 local DataStorage = require("datastorage")
 local InputContainer = require("ui/widget/container/inputcontainer")
@@ -20,7 +19,9 @@ local InfoMessage = require("ui/widget/infomessage")
 local UIManager = require("ui/uimanager")
 local ffiUtil = require("ffi/util")
 local lfs = require("libs/libkoreader-lfs")
+local logger = require("logger")
 local dump = require("dump")
+local PluginShare = require("pluginshare")
 
 local Extractor = require("extractor_vocabdeck")
 
@@ -98,18 +99,61 @@ function VocabDeckExtractor:dumpExtractionToFile()
     })
 end
 
--- Deliberately not implemented yet -- see the header comment. Once
--- AnnotationSync.koplugin#93 settles on pushExtractorData's real signature,
--- this becomes: for each language, call
--- AnnotationSync.pushExtractorData("vocabdeck", language, records, writeback_fn),
--- where writeback_fn takes the merged records back and writes any
--- last_write_wins fields into this language's cards table by merge_key.
--- Everything upstream of that call (extraction, diffing, per-field
--- timestamps) is already real; only this adapter is pending.
+-- Not built yet -- next task. pushExtractorData always calls this, whether
+-- or not anything actually changed (see AnnotationSync's extractor_push.lua)
+-- so it's safe to call unconditionally; it just doesn't persist anything
+-- into VocabDeck's own database yet. The real version needs to: for each
+-- entry in merged_records, insert a new row if normalized_phrase isn't
+-- already local (that's how a card added on another device appears here),
+-- otherwise update only the last_write_wins fields on the existing row --
+-- write_once fields on a row that already exists locally never need
+-- touching, since nothing could have legitimately overwritten them.
+local function stubWriteback(language, merged_records)
+    logger.info("vocabdeckextractor: writeback stub for", language,
+        "-- got", #merged_records, "merged record(s), not yet persisted")
+end
+
+-- One pushExtractorData call per language, matching this Extractor's
+-- <extractor_id>/<filename> namespacing (filename = language).
+function VocabDeckExtractor:pushLanguage(language)
+    local records, err = Extractor.extractLanguage(language)
+    if err then
+        logger.warn("vocabdeckextractor: extraction failed for", language, "--", err)
+        return
+    end
+    PluginShare.AnnotationSync.pushExtractorData("vocabdeck", language, records, function(merged_records)
+        stubWriteback(language, merged_records)
+    end)
+end
+
+function VocabDeckExtractor:pushAll()
+    for _, language in ipairs(Extractor.listLanguages()) do
+        self:pushLanguage(language)
+    end
+end
+
+-- AnnotationSyncRequested fires once per sync episode (manual "Sync Now" or
+-- a background reconnect), not per document -- correct here, since neither
+-- VocabDeck's cards nor the notebook log belong to any one book.
+function VocabDeckExtractor:onAnnotationSyncRequested()
+    if not PluginShare.AnnotationSync then return end
+    self:pushAll()
+end
+
+-- Manual trigger, kept alongside the automatic event hook above -- useful
+-- for testing without waiting for a real sync episode.
 function VocabDeckExtractor:onPushToAnnotationSync()
+    if not PluginShare.AnnotationSync then
+        UIManager:show(InfoMessage:new{
+            text = _("AnnotationSync isn't installed or enabled."),
+            timeout = 4,
+        })
+        return
+    end
+    self:pushAll()
     UIManager:show(InfoMessage:new{
-        text = _("Not implemented yet: AnnotationSync doesn't have a pushExtractorData interface to call. See AnnotationSync.koplugin issue #93."),
-        timeout = 5,
+        text = _("Push started. writeback isn't implemented yet, so nothing will be written back locally -- check the log for what came back."),
+        timeout = 6,
     })
 end
 
