@@ -15,8 +15,9 @@ about VocabDeck's schema.
 
 | File | Responsibility |
 |---|---|
-| `main.lua` | Plugin entry point. Registers the debug menu (Tools > VocabDeck Extractor). Owns the (currently stubbed) call into AnnotationSync. |
+| `main.lua` | Plugin entry point. Registers the debug menu (Tools > VocabDeck Extractor). Owns the real push call into AnnotationSync and the sync-event hook. |
 | `extractor_vocabdeck.lua` | The core pipeline: enumerate VocabDeck's per-language databases, read every card, compute the Merge Key, diff against the snapshot, classify fields by policy, return records. |
+| `writeback_vocabdeck.lua` | The other half: applies AnnotationSync's merged records back into VocabDeck's own database — inserts new cards, updates only the `last_write_wins` fields on existing ones, reconstructs `ai_memory_helper` from its four sub-fields, and keeps `snapshot_store.lua` in sync with what was actually written. |
 | `memory_helper_parser.lua` | Splits VocabDeck's `ai_memory_helper` text blob into its four labeled sections. Pure function, no I/O. |
 | `snapshot_store.lua` | Persists this plugin's own memory of "what did I last report for each field," entirely separate from VocabDeck's database. Thin wrapper over `LuaSettings`. |
 
@@ -33,18 +34,45 @@ about VocabDeck's schema.
    e. Save the updated snapshot for that language.
 3. Return `{ [language] = records }`.
 
-**Push to AnnotationSync (not implemented — see Status below):**
+**Push to AnnotationSync (real):**
 
-Deferred call shape, not yet real: for each language, call
-`AnnotationSync.pushExtractorData("vocabdeck", language, records, writeback_fn)`,
-where `writeback_fn` receives the post-merge records back and writes any
-`last_write_wins` field back into that language's `cards` table by Merge Key.
+For each language, `main.lua` calls
+`AnnotationSync.pushExtractorData("vocabdeck", language, records, writeback_fn)`.
+AnnotationSync merges the pushed records against whatever's on the remote
+and calls `writeback_fn` back with the merged result.
+
+**Writeback (real):**
+
+`writeback_vocabdeck.lua:Writeback.apply(language, merged_records)` applies
+that merged result into the real `cards` table, by Merge Key
+(`normalized_phrase`):
+
+1. Existing card: read the current row, compare every `last_write_wins`
+   column (and the reconstructed `ai_memory_helper`, compared by parsed
+   section rather than raw bytes — see Invariants) against the merged
+   values. If nothing actually differs, touch nothing — no `UPDATE`, no
+   `updated_at` bump, no snapshot write. Otherwise `UPDATE` only the columns
+   that changed, bump `updated_at` to now, and update
+   `snapshot_store.lua`'s memory for that card to match exactly what was
+   written (see Invariants for why this second part matters).
+2. New card (Merge Key not found locally): resolve or create its `books`
+   row by `book_filepath`, then `INSERT` a full row from every field the
+   merged record carries — including `last_write_wins` fields like FSRS
+   scheduling state, since a card arriving from another device brings its
+   own real review progress with it. This is deliberately not
+   `vocabdeck_db.lua`'s own `DB.addCard()`, which only sets identity fields
+   and lets fresh-card scheduling defaults apply — appropriate for a user
+   creating a card right now on this device, wrong for one merging in
+   already-reviewed from elsewhere.
 
 ## Invariants
 
 - **The Merge Key normalization must stay byte-for-byte identical to VocabDeck's own `normalizePhrase()`** in `vocabdeck_db.lua`. If VocabDeck ever changes its normalization, this extractor needs the matching change, or Merge Keys silently stop lining up across devices. There is no test enforcing this today — it's a manual sync point.
 - **`id` and `book_id` are never part of a record.** Both are local SQLite autoincrement values with no meaning across independently-created databases on different devices — this was the exact bug found in an earlier one-way export script that used the row `id` as a stable identifier.
-- **This plugin only reads VocabDeck's data.** It doesn't require VocabDeck's plugin code to be loaded, only that its data files exist on disk, and it never writes to VocabDeck's database (the writeback half, once built, will be the first thing that does).
+- **Extraction only reads VocabDeck's data; it doesn't require VocabDeck's plugin code to be loaded, only that its data files exist on disk.** Writeback is the one part of this plugin that does write to VocabDeck's database — deliberately implemented with raw SQL rather than requiring `vocabdeck_db.lua`, for the same decoupling reason.
+- **`snapshot_store.lua`'s `Snapshot.flush()` must be called on every real extraction, not just the debug-menu path.** `Snapshot.saveForLanguage()` only updates the in-memory `LuaSettings` object; `flush()` is what actually persists it to disk. This was originally only called at the end of `Extractor.extractAll()` (the debug menu's path) — the real push path (`pushLanguage`→`extractLanguage`) called `saveForLanguage()` but never flushed. In-memory that's invisible (the snapshot survives fine across calls within one running process), but it means a KOReader restart between real syncs silently loses all per-field memory — confirmed as a real bug via two-device testing (see the virtual-Kindle testing note below): every field gets re-stamped with a fresh `changed_at` on the next extraction regardless of whether its value actually changed, which can let a stale value incorrectly win a future `last_write_wins` merge purely from timestamp inflation. Fixed by flushing inside `extractLanguage()` itself, right after `saveForLanguage()` — not just at the end of a batch.
+- **Writeback must also keep `snapshot_store.lua` in sync with what it writes, using the same `now` for both.** If writeback updates the DB but not the snapshot, the next extraction's coarse `updated_at` gate will look mismatched, forcing a full re-diff that stamps a fresh `changed_at` on the just-written fields — silently discarding the real origin timestamp of a merge that came from another device.
+- **Writeback must compare against the *live* row, not just skip on any local change, and must compare `ai_memory_helper` by parsed section, not raw bytes.** The same four section values can legitimately serialize as `"Label: content"` or `"Label:\ncontent"` (the AI response's own formatting varies) — a raw-byte comparison here would flag an unchanged card as "different" on every single push, forever, needlessly bumping `updated_at` and re-stamping the snapshot each time.
 
 ## Decisions and why
 
@@ -57,6 +85,6 @@ where `writeback_fn` receives the post-merge records back and writes any
 
 Tracked against [AnnotationSync.koplugin#93](https://github.com/dani84bs/AnnotationSync.koplugin/issues/93).
 
-- **Working and tested against real device data:** everything under "Extraction" above. Verified against a live VocabDeck database — parsed memory-helper output matches the on-device UI exactly, and re-extracting with no changes produces byte-identical output (no spurious timestamp drift). A real single-field edit was also verified to only bump the timestamps of the fields that actually changed, nothing else on the same card or any other card.
-- **Not implemented:** the `pushExtractorData` call, listening for AnnotationSync's sync-trigger event, and the writeback half. None of that exists in AnnotationSync's code yet, and guessing at the exact function/module/event names now risks redoing this work later for no reason — it's a small, isolated adapter once his interface is real, not a redesign of anything above.
-- **Open question with the AnnotationSync maintainer:** whether Keyed Merge resolves `last_write_wins` per field or per whole pushed record. This extractor already computes real per-field timestamps regardless of the answer; the answer only affects how (or whether) they need to be collapsed before pushing.
+- **Working and tested end-to-end, including writeback, across two real, independently-editing KOReader instances**: the physical Kindle plus a Docker container running KOReader's official Linux desktop build (same plugins, same starting data, syncing against the same server) — not just extraction against a single device anymore. Verified: fresh push from both against an empty remote converges cleanly; a real edit on one device correctly appears via writeback in the other device's actual database on its next sync; the identical field edited differently on both devices, synced in *reversed* order (the device with the older edit syncs first), still converges on the objectively newer edit regardless of sync order, while untouched fields on the same card stay independently correct.
+- **Two real bugs found via that two-device testing, both fixed**: the missing `Snapshot.flush()` on the real path (see Invariants), and an early writeback draft comparing `ai_memory_helper` by raw bytes instead of parsed sections (also in Invariants).
+- **Keyed Merge resolves `last_write_wins` per field**, confirmed both by reading `keyed_merge.lua` and by the reversed-sync-order test above.

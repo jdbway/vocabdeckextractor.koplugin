@@ -8,10 +8,8 @@
 -- disk, since extraction only ever reads files VocabDeck itself already
 -- writes.
 --
--- Status: extraction, the sync-event hook, and the real pushExtractorData
--- call are all live. writeback_fn (turning merged records back into
--- VocabDeck rows -- the only way a card created on another device shows up
--- here) is still a stub -- see stubWriteback() below.
+-- Status: extraction, the sync-event hook, pushExtractorData, and writeback
+-- (see writeback_vocabdeck.lua) are all live.
 local _ = require("gettext")
 local DataStorage = require("datastorage")
 local InputContainer = require("ui/widget/container/inputcontainer")
@@ -24,6 +22,7 @@ local dump = require("dump")
 local PluginShare = require("pluginshare")
 
 local Extractor = require("extractor_vocabdeck")
+local Writeback = require("writeback_vocabdeck")
 
 local VOCABDECK_DATA_DIR = ffiUtil.joinPath(DataStorage:getDataDir(), "vocabdeck")
 
@@ -99,18 +98,47 @@ function VocabDeckExtractor:dumpExtractionToFile()
     })
 end
 
--- Not built yet -- next task. pushExtractorData always calls this, whether
--- or not anything actually changed (see AnnotationSync's extractor_push.lua)
--- so it's safe to call unconditionally; it just doesn't persist anything
--- into VocabDeck's own database yet. The real version needs to: for each
--- entry in merged_records, insert a new row if normalized_phrase isn't
--- already local (that's how a card added on another device appears here),
--- otherwise update only the last_write_wins fields on the existing row --
--- write_once fields on a row that already exists locally never need
--- touching, since nothing could have legitimately overwritten them.
-local function stubWriteback(language, merged_records)
-    logger.info("vocabdeckextractor: writeback stub for", language,
-        "-- got", #merged_records, "merged record(s), not yet persisted")
+-- ============================================================
+-- TEST HARNESS -- kept in place deliberately for reuse in future test runs.
+-- If AUTOTEST_TRIGGER exists at boot, appends timestamped progress
+-- lines to AUTOTEST_STATUS (init reached, push fired, each writeback
+-- actually called back) so a remote session can drive and verify a full
+-- test cycle via SSH without anyone tapping a menu. Guarded so it's
+-- completely inert unless the trigger file is deliberately created.
+-- ============================================================
+local AUTOTEST_TRIGGER = "/mnt/us/autotest_trigger.txt"
+local AUTOTEST_STATUS = "/mnt/us/vd_autotest_status.txt"
+local autotest_enabled = false
+
+local function autotestLog(line)
+    if not autotest_enabled then return end
+    local f = io.open(AUTOTEST_STATUS, "a")
+    if f then
+        f:write(line .. ":" .. os.time() .. "\n")
+        f:close()
+    end
+end
+
+function VocabDeckExtractor:runAutotestIfTriggered()
+    if lfs.attributes(AUTOTEST_TRIGGER, "mode") ~= "file" then return end
+    autotest_enabled = true
+    autotestLog("init_reached")
+    UIManager:scheduleIn(5, function()
+        autotestLog("push_firing")
+        local ok, err = pcall(function() self:pushAll() end)
+        autotestLog(ok and "push_call_returned" or ("push_call_error:" .. tostring(err)))
+    end)
+end
+-- ============================================================
+-- END TEST HARNESS
+-- ============================================================
+
+local function applyWriteback(language, merged_records)
+    local ok, err = pcall(Writeback.apply, language, merged_records)
+    if not ok then
+        logger.warn("vocabdeckextractor: writeback failed for", language, "--", tostring(err))
+    end
+    autotestLog("writeback_called:" .. language .. ":" .. #merged_records)
 end
 
 -- One pushExtractorData call per language, matching this Extractor's
@@ -122,7 +150,7 @@ function VocabDeckExtractor:pushLanguage(language)
         return
     end
     PluginShare.AnnotationSync.pushExtractorData("vocabdeck", language, records, function(merged_records)
-        stubWriteback(language, merged_records)
+        applyWriteback(language, merged_records)
     end)
 end
 
@@ -152,7 +180,7 @@ function VocabDeckExtractor:onPushToAnnotationSync()
     end
     self:pushAll()
     UIManager:show(InfoMessage:new{
-        text = _("Push started. writeback isn't implemented yet, so nothing will be written back locally -- check the log for what came back."),
+        text = _("Push started -- check the log for results."),
         timeout = 6,
     })
 end
@@ -188,6 +216,7 @@ function VocabDeckExtractor:init()
     if self.ui and self.ui.menu and self.ui.menu.registerToMainMenu then
         self.ui.menu:registerToMainMenu(self)
     end
+    self:runAutotestIfTriggered()
 end
 
 return VocabDeckExtractor

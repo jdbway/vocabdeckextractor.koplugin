@@ -245,6 +245,7 @@ function Extractor.extractLanguage(language)
             end
         end
         Snapshot.saveForLanguage(language, language_snapshot)
+        Snapshot.flush()
         return records
     end)
     conn:close()

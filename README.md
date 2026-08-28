@@ -14,16 +14,15 @@ internally, the module map, and the design decisions behind it.
 
 ## Status
 
-**Working today:** reading VocabDeck's databases, computing stable
-cross-device Merge Keys, classifying every field by merge policy, parsing
-the AI memory helper into its separate sections, and computing accurate
-per-field change timestamps. Verified against real device data — see
+**Working today:** the full round trip — reading VocabDeck's databases,
+computing stable cross-device Merge Keys, classifying every field by merge
+policy, parsing the AI memory helper into its separate sections, computing
+accurate per-field change timestamps, pushing to AnnotationSync, and writing
+merged results back into VocabDeck's own database (new cards inserted,
+existing cards updated field-by-field). Verified end-to-end across two real,
+independently-editing KOReader instances — see
 [ARCHITECTURE.md](ARCHITECTURE.md#status--non-goals) for what's been tested
 and how.
-
-**Not implemented yet:** actually pushing to AnnotationSync. Its side of
-this interface doesn't exist yet — tracked on
-[AnnotationSync.koplugin#93](https://github.com/dani84bs/AnnotationSync.koplugin/issues/93).
 
 ## Installation
 
