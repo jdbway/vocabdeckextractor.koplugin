@@ -213,6 +213,7 @@ function VocabDeckExtractor:addToMainMenu(menu_items)
 end
 
 function VocabDeckExtractor:init()
+    logger.info("vocabdeckextractor: version", require("_meta").version)
     if self.ui and self.ui.menu and self.ui.menu.registerToMainMenu then
         self.ui.menu:registerToMainMenu(self)
     end
