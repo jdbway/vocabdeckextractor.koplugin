@@ -2704,4 +2704,3 @@ function DB.updateCardMemoryHelper(card_id, helper_text)
 end
 
 return DB
--- TEST -- simulated schema drift for demo purposes, will be reverted --
