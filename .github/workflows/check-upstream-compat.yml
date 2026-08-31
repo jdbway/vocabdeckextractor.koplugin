@@ -22,13 +22,33 @@ permissions:
 jobs:
   check-compat:
     runs-on: ubuntu-latest
+    env:
+      KOREADER_VERSION: "2026.07.1"
     steps:
       # Clones this repo (vocabdeckextractor.koplugin) onto the runner.
       # Every workflow that needs the repo's own files starts with this.
       - name: Check out this repo
         uses: actions/checkout@v4
 
-      - name: Compare pinned files against upstream
+      # KOReader's Linux .deb ships luajit plus every frontend/common Lua
+      # module (datastorage, logger, the real lua-ljsqlite3 FFI binding,
+      # etc.) that both VocabDeck's and this extractor's code need via
+      # require(). Installing it directly on the runner -- no Xvfb, no
+      # display, no GUI boot at all -- is enough: setupkoenv.lua (KOReader's
+      # own require()-path bootstrap) plus KOReader's bundled luajit gives a
+      # fully working headless Lua environment for pure data-layer code like
+      # vocabdeck_db.lua. Confirmed live against the actual virtual-Kindle
+      # container before building this: no display server needed anywhere
+      # in this job.
+      - name: Install KOReader's headless Lua runtime
+        run: |
+          set -eu
+          wget -q "https://github.com/koreader/koreader/releases/download/v${KOREADER_VERSION}/koreader_${KOREADER_VERSION}-1_amd64.deb"
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends "./koreader_${KOREADER_VERSION}-1_amd64.deb"
+          rm -f "koreader_${KOREADER_VERSION}-1_amd64.deb"
+
+      - name: Check compatibility against real upstream code
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -51,34 +71,40 @@ jobs:
 
           echo "Upstream moved: $PINNED_COMMIT -> $UPSTREAM_HEAD"
 
-          # Diff every watched file. If ANY of them changed since our last
-          # known-good snapshot, we don't trust the pin anymore.
-          #
-          # Note on style: every string built below uses printf with explicit
-          # \n's on ONE physical line, rather than a shell variable assignment
-          # that spans multiple literal lines. That's not a style preference --
-          # this whole script is itself the content of a YAML block scalar
-          # (the "run: |" above), and YAML requires every physical line to
-          # stay indented at least as far as the block started. A literal
-          # multi-line bash string breaks that the moment a continuation line
-          # (e.g. a markdown ``` fence starting at column 0) dips below that
-          # indentation -- YAML silently ends the block right there and
-          # parses whatever follows as top-level YAML, which is exactly what
-          # happened on the first attempt at this file.
-          DRIFTED=0
-          DIFF_OUTPUT=""
-          for f in $(jq -r '.watched_files[]' "$PIN_FILE"); do
-            if ! diff -u "$PIN_DIR/$f" "/tmp/upstream/$f" > /tmp/diff_out 2>&1; then
-              DRIFTED=1
-              DIFF_OUTPUT="$DIFF_OUTPUT$(printf '\n\n### %s\n```diff\n%s\n```' "$f" "$(cat /tmp/diff_out)")"
-            fi
-          done
+          # PRIMARY gate: actually exercise upstream's real vocabdeck_db.lua
+          # (fresh clone, not our snapshot) to create a card the way
+          # VocabDeck itself would, then run our own extractor against that
+          # same on-disk database and assert every field round-trips. See
+          # test/behavioral_check.lua for why this beats a source-file diff:
+          # a diff can be a false alarm (a comment or rename with no real
+          # behavior change) or a false pass (a formatting-only diff hiding
+          # a real change) -- this proves the actual behavior.
+          export KO_MULTIUSER=1
+          export KO_HOME=/tmp/ko_ci_home
+          mkdir -p "$KO_HOME"
+          export UPSTREAM_DIR=/tmp/upstream
+          export EXTRACTOR_DIR="$GITHUB_WORKSPACE"
 
-          if [ "$DRIFTED" = "0" ]; then
-            echo "No watched files changed -- safe to auto-advance the pin."
-            for f in $(jq -r '.watched_files[]' "$PIN_FILE"); do
-              cp "/tmp/upstream/$f" "$PIN_DIR/$f"
-            done
+          set +e
+          BEHAVIORAL_OUTPUT=$(cd /usr/lib/koreader && ./luajit -e "dofile('setupkoenv.lua'); dofile(os.getenv('EXTRACTOR_DIR') .. '/test/behavioral_check.lua')" 2>&1)
+          BEHAVIORAL_STATUS=$?
+          set -e
+          echo "$BEHAVIORAL_OUTPUT"
+
+          # SECONDARY check: vocabdeck_memory_helper.lua asks an AI provider
+          # for a fixed set of plain-text section labels (see
+          # memory_helper_parser.lua's own comment) -- there's no pure,
+          # non-AI-calling function to exercise behaviorally, so this file
+          # stays on the source-diff approach from v1.
+          MEM_DRIFTED=0
+          if ! diff -u "$PIN_DIR/vocabdeck_memory_helper.lua" "/tmp/upstream/vocabdeck_memory_helper.lua" > /tmp/mem_diff 2>&1; then
+            MEM_DRIFTED=1
+          fi
+
+          if [ "$BEHAVIORAL_STATUS" = "0" ] && [ "$MEM_DRIFTED" = "0" ]; then
+            echo "Behavioral check passed and memory-helper format unchanged -- safe to auto-advance the pin."
+            cp "/tmp/upstream/vocabdeck_db.lua" "$PIN_DIR/vocabdeck_db.lua"
+            cp "/tmp/upstream/vocabdeck_memory_helper.lua" "$PIN_DIR/vocabdeck_memory_helper.lua"
             jq --arg sha "$UPSTREAM_HEAD" --arg date "$(date -u +%Y-%m-%d)" \
               '.pinned_commit = $sha | .last_checked = $date' "$PIN_FILE" > /tmp/pin.json
             mv /tmp/pin.json "$PIN_FILE"
@@ -86,16 +112,25 @@ jobs:
             git config user.name "github-actions[bot]"
             git config user.email "github-actions[bot]@users.noreply.github.com"
             git add "$PIN_DIR"
-            git commit -m "Auto-advance vocabdeck.koplugin pin to $UPSTREAM_HEAD (no watched-file changes)"
+            git commit -m "Auto-advance vocabdeck.koplugin pin to $UPSTREAM_HEAD (behavioral check passed, memory-helper format unchanged)"
             git push
             exit 0
           fi
 
-          echo "Watched file(s) changed -- NOT advancing the pin. Filing an issue."
+          echo "Compatibility check failed -- NOT advancing the pin. Filing an issue."
 
           TITLE="Upstream drift: vocabdeck.koplugin"
-          BODY=$(printf '%s moved from `%s` to `%s` on `%s`, and at least one file this extractor depends on changed in that range.\n\nThis pin was **not** auto-advanced -- someone needs to check whether `extractor_vocabdeck.lua` / `memory_helper_parser.lua` still parse the new format correctly, then update `%s/pin.json` and the snapshot file(s) by hand once confirmed.\n%s' \
-            "$UPSTREAM_REPO" "$PINNED_COMMIT" "$UPSTREAM_HEAD" "$UPSTREAM_BRANCH" "$PIN_DIR" "$DIFF_OUTPUT")
+          BODY=$(printf '%s moved from `%s` to `%s` on `%s`.\n\nThis pin was **not** auto-advanced.\n' "$UPSTREAM_REPO" "$PINNED_COMMIT" "$UPSTREAM_HEAD" "$UPSTREAM_BRANCH")
+
+          if [ "$BEHAVIORAL_STATUS" != "0" ]; then
+            BODY="$BODY$(printf '\n### Behavioral check failed\n\nRan upstream'"'"'s real vocabdeck_db.lua against extractor_vocabdeck.lua directly (see test/behavioral_check.lua) and the fields did not round-trip:\n\n```\n%s\n```\n' "$BEHAVIORAL_OUTPUT")"
+          fi
+
+          if [ "$MEM_DRIFTED" = "1" ]; then
+            BODY="$BODY$(printf '\n### vocabdeck_memory_helper.lua changed (source diff -- not behaviorally testable, needs a human look)\n\n```diff\n%s\n```\n' "$(cat /tmp/mem_diff)")"
+          fi
+
+          BODY="$BODY$(printf '\nOnce fixed and confirmed, update `%s/pin.json` and the snapshot file(s) by hand.\n' "$PIN_DIR")"
 
           EXISTING=$(gh issue list --search "\"$TITLE\" in:title" --state open --json number --jq '.[0].number' || true)
           if [ -n "${EXISTING:-}" ]; then
