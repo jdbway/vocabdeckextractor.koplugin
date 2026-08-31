@@ -71,14 +71,18 @@ jobs:
 
           echo "Upstream moved: $PINNED_COMMIT -> $UPSTREAM_HEAD"
 
-          # PRIMARY gate: actually exercise upstream's real vocabdeck_db.lua
-          # (fresh clone, not our snapshot) to create a card the way
-          # VocabDeck itself would, then run our own extractor against that
-          # same on-disk database and assert every field round-trips. See
-          # test/behavioral_check.lua for why this beats a source-file diff:
-          # a diff can be a false alarm (a comment or rename with no real
-          # behavior change) or a false pass (a formatting-only diff hiding
-          # a real change) -- this proves the actual behavior.
+          # The ONLY gate: actually exercise upstream's real code (fresh
+          # clone, not a stored snapshot) and assert this extractor still
+          # reads it correctly. See test/behavioral_check.lua.
+          #
+          # There is deliberately no source-file diffing left here. Diffing
+          # the files an extractor happens to depend on is brittle in a
+          # specific way dani84bs pointed out (issue #4): if upstream
+          # refactors an implementation into some *other* file, the watched
+          # file stops changing and the alert silently stops firing -- a
+          # whack-a-mole race where the check quietly rots into a no-op.
+          # Invoking the real functions has no such blind spot: wherever the
+          # implementation lives, it either still works or it breaks loudly.
           export KO_MULTIUSER=1
           export KO_HOME=/tmp/ko_ci_home
           mkdir -p "$KO_HOME"
@@ -91,28 +95,16 @@ jobs:
           set -e
           echo "$BEHAVIORAL_OUTPUT"
 
-          # SECONDARY check: vocabdeck_memory_helper.lua asks an AI provider
-          # for a fixed set of plain-text section labels (see
-          # memory_helper_parser.lua's own comment) -- there's no pure,
-          # non-AI-calling function to exercise behaviorally, so this file
-          # stays on the source-diff approach from v1.
-          MEM_DRIFTED=0
-          if ! diff -u "$PIN_DIR/vocabdeck_memory_helper.lua" "/tmp/upstream/vocabdeck_memory_helper.lua" > /tmp/mem_diff 2>&1; then
-            MEM_DRIFTED=1
-          fi
-
-          if [ "$BEHAVIORAL_STATUS" = "0" ] && [ "$MEM_DRIFTED" = "0" ]; then
-            echo "Behavioral check passed and memory-helper format unchanged -- safe to auto-advance the pin."
-            cp "/tmp/upstream/vocabdeck_db.lua" "$PIN_DIR/vocabdeck_db.lua"
-            cp "/tmp/upstream/vocabdeck_memory_helper.lua" "$PIN_DIR/vocabdeck_memory_helper.lua"
+          if [ "$BEHAVIORAL_STATUS" = "0" ]; then
+            echo "Behavioral check passed -- safe to auto-advance the pin."
             jq --arg sha "$UPSTREAM_HEAD" --arg date "$(date -u +%Y-%m-%d)" \
               '.pinned_commit = $sha | .last_checked = $date' "$PIN_FILE" > /tmp/pin.json
             mv /tmp/pin.json "$PIN_FILE"
 
             git config user.name "github-actions[bot]"
             git config user.email "github-actions[bot]@users.noreply.github.com"
-            git add "$PIN_DIR"
-            git commit -m "Auto-advance vocabdeck.koplugin pin to $UPSTREAM_HEAD (behavioral check passed, memory-helper format unchanged)"
+            git add "$PIN_FILE"
+            git commit -m "Auto-advance vocabdeck.koplugin pin to $UPSTREAM_HEAD (behavioral check passed)"
             git push
             exit 0
           fi
@@ -120,17 +112,8 @@ jobs:
           echo "Compatibility check failed -- NOT advancing the pin. Filing an issue."
 
           TITLE="Upstream drift: vocabdeck.koplugin"
-          BODY=$(printf '%s moved from `%s` to `%s` on `%s`.\n\nThis pin was **not** auto-advanced.\n' "$UPSTREAM_REPO" "$PINNED_COMMIT" "$UPSTREAM_HEAD" "$UPSTREAM_BRANCH")
-
-          if [ "$BEHAVIORAL_STATUS" != "0" ]; then
-            BODY="$BODY$(printf '\n### Behavioral check failed\n\nRan upstream'"'"'s real vocabdeck_db.lua against extractor_vocabdeck.lua directly (see test/behavioral_check.lua) and the fields did not round-trip:\n\n```\n%s\n```\n' "$BEHAVIORAL_OUTPUT")"
-          fi
-
-          if [ "$MEM_DRIFTED" = "1" ]; then
-            BODY="$BODY$(printf '\n### vocabdeck_memory_helper.lua changed (source diff -- not behaviorally testable, needs a human look)\n\n```diff\n%s\n```\n' "$(cat /tmp/mem_diff)")"
-          fi
-
-          BODY="$BODY$(printf '\nOnce fixed and confirmed, update `%s/pin.json` and the snapshot file(s) by hand.\n' "$PIN_DIR")"
+          BODY=$(printf '%s moved from `%s` to `%s` on `%s`.\n\nThis pin was **not** auto-advanced -- the behavioral check failed.\n\nRan upstream'"'"'s real `vocabdeck_db.lua` / `vocabdeck_memory_helper.lua` against this extractor directly (see `test/behavioral_check.lua`):\n\n```\n%s\n```\n\nOnce fixed and confirmed, update `%s/pin.json`.\n' \
+            "$UPSTREAM_REPO" "$PINNED_COMMIT" "$UPSTREAM_HEAD" "$UPSTREAM_BRANCH" "$BEHAVIORAL_OUTPUT" "$PIN_DIR")
 
           EXISTING=$(gh issue list --search "\"$TITLE\" in:title" --state open --json number --jq '.[0].number' || true)
           if [ -n "${EXISTING:-}" ]; then

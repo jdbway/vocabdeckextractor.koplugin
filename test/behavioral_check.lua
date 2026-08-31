@@ -54,6 +54,58 @@ assert(book_id, "DB.getOrCreateBook returned nil -- upstream's book-creation API
 local card_id = DB.addCard(book_id, EXPECTED)
 assert(card_id, "DB.addCard returned nil -- upstream's card-creation API may have changed shape")
 
+-- ---------------------------------------------------------------------------
+-- Memory-helper section labels.
+--
+-- vocabdeck_memory_helper.lua doesn't expose a pure function that formats
+-- this text -- the text comes back from an AI provider, shaped by the prompt
+-- that file builds. So the coupling worth testing isn't a function call, it's
+-- the *section labels* the prompt demands ("Morphology:", "Collocations:",
+-- ...), since memory_helper_parser.lua splits on exactly those.
+--
+-- Critically, these labels are scraped out of upstream's own prompt source
+-- rather than hardcoded here. Hardcoding them would make this test vacuous:
+-- it would keep passing while upstream renamed a label out from under the
+-- parser, which is precisely the failure this is meant to catch.
+local function scrapeSectionLabels()
+    local f = assert(io.open(UPSTREAM_DIR .. "/vocabdeck_memory_helper.lua", "r"),
+        "couldn't open upstream vocabdeck_memory_helper.lua")
+    local source = f:read("*a")
+    f:close()
+
+    local labels = {}
+    -- Matches the prompt's own rule lines, e.g.:
+    --   - Include "Collocations:" with 2-4 common word pairings ...
+    for label in source:gmatch('Include "([^":]+):"') do
+        labels[#labels + 1] = label
+    end
+    return labels
+end
+
+local SECTION_LABELS = scrapeSectionLabels()
+
+-- Guard against a vacuous pass: if upstream restructures its prompt so the
+-- scrape pattern matches nothing, an empty label list would make every
+-- assertion below trivially true. Fail loudly instead.
+if #SECTION_LABELS == 0 then
+    io.stderr:write("COMPAT CHECK FAILED -- couldn't scrape any section labels from upstream's\n" ..
+        "vocabdeck_memory_helper.lua prompt. Its prompt structure likely changed, so\n" ..
+        "memory_helper_parser.lua's assumptions need a human review.\n")
+    os.exit(1)
+end
+
+-- Build a memory-helper blob the way upstream's prompt asks the AI to: each
+-- scraped label, blank-line separated, with distinctive content per section.
+local section_content = {}
+local blob_parts = {}
+for i, label in ipairs(SECTION_LABELS) do
+    local content = string.format("compat-check content for section %d", i)
+    section_content[label] = content
+    blob_parts[#blob_parts + 1] = label .. ": " .. content
+end
+assert(DB.updateCardMemoryHelper(card_id, table.concat(blob_parts, "\n\n")),
+    "DB.updateCardMemoryHelper failed -- upstream's memory-helper write API may have changed shape")
+
 local records, err = Extractor.extractLanguage(TEST_LANGUAGE)
 assert(not err, "Extractor.extractLanguage returned an error: " .. tostring(err))
 assert(#records == 1, "expected exactly 1 extracted record, got " .. tostring(#records))
@@ -64,6 +116,27 @@ for name, expected_value in pairs(EXPECTED) do
     local actual = fields[name] and fields[name].value
     if actual ~= expected_value then
         failures[#failures + 1] = string.format("  %s: expected %q, got %q", name, tostring(expected_value), tostring(actual))
+    end
+end
+
+-- Every section upstream's prompt asks for must land in some parsed field.
+-- Deliberately not asserting a specific label -> field mapping: that mapping
+-- is this extractor's own business. What matters for compatibility is that
+-- no section upstream produces gets silently dropped on the floor.
+local MEMORY_HELPER_FIELDS = { "morphology", "collocations", "memory_hook", "example_sentence" }
+for label, content in pairs(section_content) do
+    local found = false
+    for _, field_name in ipairs(MEMORY_HELPER_FIELDS) do
+        local entry = fields[field_name]
+        if entry and entry.value == content then
+            found = true
+            break
+        end
+    end
+    if not found then
+        failures[#failures + 1] = string.format(
+            "  memory-helper section %q was not recovered into any parsed field -- " ..
+            "memory_helper_parser.lua may not know this label", label)
     end
 end
 
