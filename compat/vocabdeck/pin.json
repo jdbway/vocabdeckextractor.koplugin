@@ -1,0 +1,10 @@
+{
+  "upstream_repo": "yupmoon/vocabdeck.koplugin",
+  "upstream_branch": "main",
+  "pinned_commit": "523dd5d69d3e73946377c36ca34739df20b0335d",
+  "watched_files": [
+    "vocabdeck_db.lua",
+    "vocabdeck_memory_helper.lua"
+  ],
+  "last_checked": "2026-08-30"
+}

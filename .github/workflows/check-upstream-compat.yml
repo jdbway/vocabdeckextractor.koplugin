@@ -1,0 +1,105 @@
+name: Check upstream VocabDeck compatibility
+
+# Two ways this can start:
+# - schedule: a cron expression, UTC time. "17 6 * * *" = 06:17 every day.
+#   (Picked an off-the-hour minute on purpose -- GitHub throttles jobs that
+#   all fire exactly on :00, so a lot of scheduled Actions pile up there.)
+# - workflow_dispatch: adds a manual "Run workflow" button on the Actions
+#   tab, with no inputs needed. Useful for testing without waiting for cron.
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+# GITHUB_TOKEN is an automatic, short-lived token GitHub mints for every
+# workflow run -- no secret to create yourself. By default it can only read
+# the repo; these two lines opt it up to also push a commit (contents) and
+# open/comment on issues (issues) in *this* repo only.
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  check-compat:
+    runs-on: ubuntu-latest
+    steps:
+      # Clones this repo (vocabdeckextractor.koplugin) onto the runner.
+      # Every workflow that needs the repo's own files starts with this.
+      - name: Check out this repo
+        uses: actions/checkout@v4
+
+      - name: Compare pinned files against upstream
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+
+          PIN_DIR="compat/vocabdeck"
+          PIN_FILE="$PIN_DIR/pin.json"
+          UPSTREAM_REPO=$(jq -r '.upstream_repo' "$PIN_FILE")
+          UPSTREAM_BRANCH=$(jq -r '.upstream_branch' "$PIN_FILE")
+          PINNED_COMMIT=$(jq -r '.pinned_commit' "$PIN_FILE")
+
+          git clone --quiet --depth 50 --branch "$UPSTREAM_BRANCH" \
+            "https://github.com/$UPSTREAM_REPO.git" /tmp/upstream
+          UPSTREAM_HEAD=$(git -C /tmp/upstream rev-parse HEAD)
+
+          if [ "$UPSTREAM_HEAD" = "$PINNED_COMMIT" ]; then
+            echo "Upstream hasn't moved since the last pin ($PINNED_COMMIT). Nothing to do."
+            exit 0
+          fi
+
+          echo "Upstream moved: $PINNED_COMMIT -> $UPSTREAM_HEAD"
+
+          # Diff every watched file. If ANY of them changed since our last
+          # known-good snapshot, we don't trust the pin anymore.
+          DRIFTED=0
+          DIFF_OUTPUT=""
+          for f in $(jq -r '.watched_files[]' "$PIN_FILE"); do
+            if ! diff -u "$PIN_DIR/$f" "/tmp/upstream/$f" > /tmp/diff_out 2>&1; then
+              DRIFTED=1
+              DIFF_OUTPUT="$DIFF_OUTPUT
+
+### $f
+\`\`\`diff
+$(cat /tmp/diff_out)
+\`\`\`"
+            fi
+          done
+
+          if [ "$DRIFTED" = "0" ]; then
+            echo "No watched files changed -- safe to auto-advance the pin."
+            for f in $(jq -r '.watched_files[]' "$PIN_FILE"); do
+              cp "/tmp/upstream/$f" "$PIN_DIR/$f"
+            done
+            jq --arg sha "$UPSTREAM_HEAD" --arg date "$(date -u +%Y-%m-%d)" \
+              '.pinned_commit = $sha | .last_checked = $date' "$PIN_FILE" > /tmp/pin.json
+            mv /tmp/pin.json "$PIN_FILE"
+
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add "$PIN_DIR"
+            git commit -m "Auto-advance vocabdeck.koplugin pin to $UPSTREAM_HEAD (no watched-file changes)"
+            git push
+            exit 0
+          fi
+
+          echo "Watched file(s) changed -- NOT advancing the pin. Filing an issue."
+
+          TITLE="Upstream drift: vocabdeck.koplugin"
+          BODY="vocabdeck.koplugin moved from \`$PINNED_COMMIT\` to \`$UPSTREAM_HEAD\` on \`$UPSTREAM_BRANCH\`, and at least one file this extractor depends on changed in that range.
+
+This pin was **not** auto-advanced -- someone needs to check whether \`extractor_vocabdeck.lua\` / \`memory_helper_parser.lua\` still parse the new format correctly, then update \`$PIN_DIR/pin.json\` and the snapshot file(s) by hand once confirmed.
+$DIFF_OUTPUT"
+
+          EXISTING=$(gh issue list --search "\"$TITLE\" in:title" --state open --json number --jq '.[0].number' || true)
+          if [ -n "${EXISTING:-}" ]; then
+            echo "Existing drift issue #$EXISTING is still open -- adding a comment instead of opening a duplicate."
+            gh issue comment "$EXISTING" --body "$BODY"
+          else
+            gh issue create --title "$TITLE" --body "$BODY"
+          fi
+
+          # Non-zero exit makes the Actions tab show this run as failed (red X),
+          # which is a second, more visible signal on top of the issue.
+          exit 1
