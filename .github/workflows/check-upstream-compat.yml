@@ -53,17 +53,24 @@ jobs:
 
           # Diff every watched file. If ANY of them changed since our last
           # known-good snapshot, we don't trust the pin anymore.
+          #
+          # Note on style: every string built below uses printf with explicit
+          # \n's on ONE physical line, rather than a shell variable assignment
+          # that spans multiple literal lines. That's not a style preference --
+          # this whole script is itself the content of a YAML block scalar
+          # (the "run: |" above), and YAML requires every physical line to
+          # stay indented at least as far as the block started. A literal
+          # multi-line bash string breaks that the moment a continuation line
+          # (e.g. a markdown ``` fence starting at column 0) dips below that
+          # indentation -- YAML silently ends the block right there and
+          # parses whatever follows as top-level YAML, which is exactly what
+          # happened on the first attempt at this file.
           DRIFTED=0
           DIFF_OUTPUT=""
           for f in $(jq -r '.watched_files[]' "$PIN_FILE"); do
             if ! diff -u "$PIN_DIR/$f" "/tmp/upstream/$f" > /tmp/diff_out 2>&1; then
               DRIFTED=1
-              DIFF_OUTPUT="$DIFF_OUTPUT
-
-### $f
-\`\`\`diff
-$(cat /tmp/diff_out)
-\`\`\`"
+              DIFF_OUTPUT="$DIFF_OUTPUT$(printf '\n\n### %s\n```diff\n%s\n```' "$f" "$(cat /tmp/diff_out)")"
             fi
           done
 
@@ -87,10 +94,8 @@ $(cat /tmp/diff_out)
           echo "Watched file(s) changed -- NOT advancing the pin. Filing an issue."
 
           TITLE="Upstream drift: vocabdeck.koplugin"
-          BODY="vocabdeck.koplugin moved from \`$PINNED_COMMIT\` to \`$UPSTREAM_HEAD\` on \`$UPSTREAM_BRANCH\`, and at least one file this extractor depends on changed in that range.
-
-This pin was **not** auto-advanced -- someone needs to check whether \`extractor_vocabdeck.lua\` / \`memory_helper_parser.lua\` still parse the new format correctly, then update \`$PIN_DIR/pin.json\` and the snapshot file(s) by hand once confirmed.
-$DIFF_OUTPUT"
+          BODY=$(printf '%s moved from `%s` to `%s` on `%s`, and at least one file this extractor depends on changed in that range.\n\nThis pin was **not** auto-advanced -- someone needs to check whether `extractor_vocabdeck.lua` / `memory_helper_parser.lua` still parse the new format correctly, then update `%s/pin.json` and the snapshot file(s) by hand once confirmed.\n%s' \
+            "$UPSTREAM_REPO" "$PINNED_COMMIT" "$UPSTREAM_HEAD" "$UPSTREAM_BRANCH" "$PIN_DIR" "$DIFF_OUTPUT")
 
           EXISTING=$(gh issue list --search "\"$TITLE\" in:title" --state open --json number --jq '.[0].number' || true)
           if [ -n "${EXISTING:-}" ]; then
