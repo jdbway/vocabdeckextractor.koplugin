@@ -12,6 +12,7 @@ local DataStorage = require("datastorage")
 local SQ3 = require("lua-ljsqlite3/init")
 local ffiUtil = require("ffi/util")
 local lfs = require("libs/libkoreader-lfs")
+local util = require("util")
 local TextUtils = require("vocabdeck_text_utils")
 
 local MemoryHelperParser = require("memory_helper_parser")
@@ -64,6 +65,7 @@ local FIELD_POLICY = {
     created_at = "write_once",
     book_title = "write_once",
     book_filepath = "write_once",
+    book_md5 = "write_once",
 
     pronunciation = "last_write_wins",
     meaning = "last_write_wins",
@@ -144,9 +146,10 @@ local function valuesEqual(a, b)
 end
 
 -- Diffs one already-fetched card row against this extractor's own memory of
--- it, filling in book_title/book_filepath and the parsed memory-helper
--- sections, and returns the merge key plus a fully-timestamped field table.
--- `language_snapshot` is mutated in place (the caller persists it).
+-- it, filling in book_title/book_filepath/book_md5 and the parsed
+-- memory-helper sections, and returns the merge key plus a fully-timestamped
+-- field table. `language_snapshot` is mutated in place (the caller persists
+-- it).
 local function buildRecord(row, book_titles, language_snapshot, now)
     local normalized = normalizePhrase(row.phrase)
     if normalized == "" then return nil end
@@ -172,6 +175,20 @@ local function buildRecord(row, book_titles, language_snapshot, now)
         created_at = tonumber(row.created_at),
         book_title = book.title or "",
         book_filepath = book.filepath or "",
+        -- Same partial-content hash AnnotationSync itself uses to identify a
+        -- book across devices (SyncManager:_getAnnotationFilename() in
+        -- AnnotationSync.koplugin's manager.lua, when use_filename is off --
+        -- the default). book_filepath alone can't serve this purpose: it's a
+        -- raw absolute path, which won't match across devices with
+        -- different OSes, mount points, or library layouts. This lets a
+        -- future consumer (e.g. a dashboard) join a card back to the same
+        -- book's annotations/other Extractors' records without depending on
+        -- path equality. Not used as this record's own merge_key -- that's
+        -- normalized_phrase, a per-card identity, not a per-book one -- this
+        -- is carried as a plain field instead. Computed once per book (see
+        -- the book_titles loop above), not here, and already "" (not nil)
+        -- if the book file wasn't readable at extraction time.
+        book_md5 = book.md5 or "",
 
         pronunciation = row.pronunciation or "",
         meaning = row.meaning or "",
@@ -232,7 +249,11 @@ function Extractor.extractLanguage(language)
     local ok, result = pcall(function()
         local book_titles = {}
         for _, row in ipairs(fetchRows(conn, "SELECT id, title, filepath FROM books;")) do
-            book_titles[tonumber(row.id)] = { title = row.title, filepath = row.filepath }
+            -- Computed once per book, not once per card -- a book with many
+            -- cards would otherwise reopen and reread the same file
+            -- redundantly for every single card that belongs to it.
+            local md5 = row.filepath and row.filepath ~= "" and util.partialMD5(row.filepath)
+            book_titles[tonumber(row.id)] = { title = row.title, filepath = row.filepath, md5 = md5 or "" }
         end
 
         local now = os.time()

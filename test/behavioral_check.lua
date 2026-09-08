@@ -46,9 +46,22 @@ local EXPECTED = {
     user_note = "note added by the compatibility check",
 }
 
+local util = require("util")
+
 DB.setLanguage(TEST_LANGUAGE)
 
-local book_id = DB.getOrCreateBook("Compat Check Book", "/fake/compat-check.epub", EXPECTED.source_language)
+-- A real file, not a fake path -- util.partialMD5 (what book_md5 is built on,
+-- see extractor_vocabdeck.lua) opens and reads the file at this path. A
+-- nonexistent path would still "pass" by silently degrading to "", which
+-- wouldn't actually prove the hash gets computed and threaded through
+-- correctly.
+local BOOK_PATH = os.getenv("KO_HOME") .. "/compat-check-book.epub"
+local book_file = assert(io.open(BOOK_PATH, "w"), "couldn't create test book file at " .. BOOK_PATH)
+book_file:write("compat-check book content, just needs to be a real readable file")
+book_file:close()
+local EXPECTED_BOOK_MD5 = assert(util.partialMD5(BOOK_PATH), "util.partialMD5 couldn't hash the test book file it just created")
+
+local book_id = DB.getOrCreateBook("Compat Check Book", BOOK_PATH, EXPECTED.source_language)
 assert(book_id, "DB.getOrCreateBook returned nil -- upstream's book-creation API may have changed shape")
 
 local card_id = DB.addCard(book_id, EXPECTED)
@@ -117,6 +130,17 @@ for name, expected_value in pairs(EXPECTED) do
     if actual ~= expected_value then
         failures[#failures + 1] = string.format("  %s: expected %q, got %q", name, tostring(expected_value), tostring(actual))
     end
+end
+
+-- book_md5: the same partial-content hash AnnotationSync itself uses to
+-- identify a book across devices (see extractor_vocabdeck.lua's comment on
+-- this field). Asserted against a hash computed independently here, not
+-- just "is it non-empty" -- proves the value that actually reaches the
+-- book_md5 field is the real hash of the real book file, not some other
+-- string that happens to be non-empty.
+local actual_book_md5 = fields.book_md5 and fields.book_md5.value
+if actual_book_md5 ~= EXPECTED_BOOK_MD5 then
+    failures[#failures + 1] = string.format("  book_md5: expected %q, got %q", tostring(EXPECTED_BOOK_MD5), tostring(actual_book_md5))
 end
 
 -- Every section upstream's prompt asks for must land in some parsed field.
